@@ -1,39 +1,26 @@
 
-import os
-import json
+import csv
+import io
 import re
 from datetime import datetime
-from typing import Dict, Any
 
-import gspread
-from fastapi import FastAPI, HTTPException, Query
+import requests
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from google.oauth2.service_account import Credentials
 
 
 # ============================================================
-# CONFIGURATION
+# GOOGLE SHEET
 # ============================================================
 
 SPREADSHEET_ID = "1FIbRKZURuq11JXmkp0w-erTdroI2fWCoZhmxjpze-uE"
 
-# These MUST exactly match the Google Sheet tab names.
-SECTION_SHEETS = {
-    "313-AIAGAI-1D": "313-AIAGAI-1D",
-    "106-AIDE-1A": "106-AIDE-1A",
-    "109-AIDE-1B": "109-AIDE-1B",
-}
 
-ALLOWED_STATUSES = {
-    "present": "Present",
-    "p": "Present",
-    "yes": "Present",
-    "1": "Present",
-
-    "absent": "Absent",
-    "a": "Absent",
-    "no": "Absent",
-    "0": "Absent",
+# Replace these GIDs with the actual GID of each section tab.
+SECTION_GIDS = {
+    "313-AIAGAI-1D": "GID_FOR_SECTION_1",
+    "106-AIDE-1A": "GID_FOR_SECTION_2",
+    "109-AIDE-1B": "GID_FOR_SECTION_3",
 }
 
 
@@ -42,13 +29,9 @@ ALLOWED_STATUSES = {
 # ============================================================
 
 app = FastAPI(
-    title="ERP Attendance Automation API",
-    version="1.0.0",
+    title="ERP Attendance Automation"
 )
 
-
-# IMPORTANT:
-# The ERP page is on a different origin, so the browser needs CORS.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -59,311 +42,262 @@ app.add_middleware(
 
 
 # ============================================================
-# GOOGLE SHEETS AUTHENTICATION
-# ============================================================
-
-def get_google_client():
-    """
-    Reads the Google service-account JSON from the
-    GOOGLE_SERVICE_ACCOUNT_JSON environment variable.
-    """
-
-    raw_credentials = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
-
-    if not raw_credentials:
-        raise RuntimeError(
-            "GOOGLE_SERVICE_ACCOUNT_JSON environment variable is missing."
-        )
-
-    try:
-        credentials_info = json.loads(raw_credentials)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(
-            "GOOGLE_SERVICE_ACCOUNT_JSON is not valid JSON."
-        ) from exc
-
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets.readonly"
-    ]
-
-    credentials = Credentials.from_service_account_info(
-        credentials_info,
-        scopes=scopes,
-    )
-
-    return gspread.authorize(credentials)
-
-
-# ============================================================
 # HELPERS
 # ============================================================
 
-def normalize(value: Any) -> str:
-    """
-    Normalize text for reliable comparison.
-    """
-
-    if value is None:
-        return ""
-
-    value = str(value)
-
-    # Remove spaces, line breaks and invisible characters.
-    value = value.replace("\u200b", "")
-    value = value.replace("\xa0", " ")
-
-    return value.strip()
+def clean(value):
+    return str(value or "").strip()
 
 
-def normalize_reg_no(value: Any) -> str:
-    """
-    Normalize registration numbers.
-
-    Example:
-        252U1R8045
-        252U1R8045
-        252U1R8045
-    """
-
-    value = normalize(value)
-
-    return re.sub(r"\s+", "", value).upper()
+def normalize_reg(value):
+    return re.sub(
+        r"\s+",
+        "",
+        clean(value).upper()
+    )
 
 
-def normalize_date(value: Any) -> str:
-    """
-    Convert different date formats to DD-MM-YYYY.
-
-    Supported examples:
-
-        01-09-2026
-        01/09/2026
-        01.09.2026
-        2026-09-01
-    """
-
-    value = normalize(value)
+def normalize_date(value):
+    value = clean(value)
 
     formats = [
         "%d-%m-%Y",
         "%d/%m/%Y",
         "%d.%m.%Y",
         "%Y-%m-%d",
-        "%d-%m-%y",
-        "%d/%m/%y",
     ]
 
     for fmt in formats:
         try:
-            parsed = datetime.strptime(value, fmt)
-            return parsed.strftime("%d-%m-%Y")
+            return datetime.strptime(
+                value,
+                fmt
+            ).strftime("%d-%m-%Y")
         except ValueError:
             pass
 
     return value
 
 
-def find_date_column(headers, requested_date):
-    """
-    Find the column containing the requested date.
-    """
+def normalize_status(value):
 
-    requested_date = normalize_date(requested_date)
+    value = clean(value).lower()
 
-    for index, header in enumerate(headers):
-        header_normalized = normalize_date(header)
+    if value in {
+        "present",
+        "p",
+        "yes",
+        "1"
+    }:
+        return "Present"
 
-        if header_normalized == requested_date:
-            return index
+    if value in {
+        "absent",
+        "a",
+        "no",
+        "0"
+    }:
+        return "Absent"
 
     return None
 
 
-def find_registration_column(headers):
-    """
-    Find the registration-number column.
+# ============================================================
+# READ GOOGLE SHEET
+# ============================================================
 
-    We support several common header names.
-    """
+def read_sheet(section):
 
-    possible_names = {
-        "registration number",
+    if section not in SECTION_GIDS:
+        raise ValueError(
+            f"Unknown section: {section}"
+        )
+
+    gid = SECTION_GIDS[section]
+
+    url = (
+        f"https://docs.google.com/spreadsheets/d/"
+        f"{SPREADSHEET_ID}/export"
+        f"?format=csv&gid={gid}"
+    )
+
+    response = requests.get(
+        url,
+        timeout=30
+    )
+
+    if response.status_code != 200:
+        raise ValueError(
+            f"Google Sheets returned HTTP "
+            f"{response.status_code}"
+        )
+
+    text = response.text
+
+    if not text.strip():
+        raise ValueError(
+            "Google Sheet returned empty data."
+        )
+
+    return list(
+        csv.reader(
+            io.StringIO(text)
+        )
+    )
+
+
+# ============================================================
+# FIND REGISTRATION COLUMN
+# ============================================================
+
+def find_reg_column(headers):
+
+    possible = {
         "registration no",
+        "registration number",
         "reg no",
-        "reg. no",
         "regno",
-        "registration",
         "roll no",
         "roll number",
-        "student id",
-        "id",
+        "registration",
     }
 
     for index, header in enumerate(headers):
 
-        normalized_header = (
-            normalize(header)
+        normalized = (
+            clean(header)
             .lower()
-            .replace("_", " ")
         )
 
-        if normalized_header in possible_names:
+        if normalized in possible:
             return index
 
-    # Fallback:
-    # Search for headers containing registration / reg / roll.
+    # Fallback search
     for index, header in enumerate(headers):
 
-        normalized_header = (
-            normalize(header)
+        normalized = (
+            clean(header)
             .lower()
         )
 
         if (
-            "registration" in normalized_header
-            or "reg no" in normalized_header
-            or "roll" in normalized_header
+            "registration" in normalized
+            or "reg no" in normalized
+            or "roll" in normalized
         ):
             return index
 
     return None
 
 
-def convert_status(value):
-    """
-    Convert sheet value into Present / Absent.
-
-    Unknown values return None.
-    """
-
-    value = normalize(value).lower()
-
-    if not value:
-        return None
-
-    return ALLOWED_STATUSES.get(value)
-
-
 # ============================================================
-# READ ATTENDANCE
+# FIND DATE COLUMN
 # ============================================================
 
-def read_attendance(section: str, requested_date: str):
-    """
-    Read one section and one date from Google Sheets.
-    """
+def find_date_column(headers, requested_date):
 
-    if section not in SECTION_SHEETS:
-        raise ValueError(
-            f"Unknown section: {section}"
-        )
-
-    sheet_name = SECTION_SHEETS[section]
-
-    client = get_google_client()
-
-    spreadsheet = client.open_by_key(SPREADSHEET_ID)
-
-    try:
-        worksheet = spreadsheet.worksheet(sheet_name)
-    except gspread.WorksheetNotFound:
-        raise ValueError(
-            f"Google Sheet tab '{sheet_name}' was not found."
-        )
-
-    values = worksheet.get_all_values()
-
-    if not values:
-        raise ValueError(
-            f"Sheet '{sheet_name}' is empty."
-        )
-
-    headers = values[0]
-
-    # --------------------------------------------------------
-    # Find registration-number column
-    # --------------------------------------------------------
-
-    reg_column = find_registration_column(headers)
-
-    if reg_column is None:
-        raise ValueError(
-            "Could not find registration-number column. "
-            "Expected something like 'Registration No'."
-        )
-
-    # --------------------------------------------------------
-    # Find date column
-    # --------------------------------------------------------
-
-    date_column = find_date_column(
-        headers,
+    requested_date = normalize_date(
         requested_date
     )
 
-    if date_column is None:
+    for index, header in enumerate(headers):
 
-        available_dates = [
-            normalize(header)
-            for header in headers
-            if normalize(header)
-        ]
+        if normalize_date(header) == requested_date:
+            return index
 
-        raise ValueError(
-            f"Date '{requested_date}' was not found. "
-            f"Available headers: {available_dates}"
-        )
-
-    # --------------------------------------------------------
-    # Build attendance dictionary
-    # --------------------------------------------------------
-
-    students: Dict[str, str] = {}
-
-    ignored_rows = 0
-    invalid_status_rows = 0
-
-    for row in values[1:]:
-
-        if reg_column >= len(row):
-            ignored_rows += 1
-            continue
-
-        reg_no = normalize_reg_no(
-            row[reg_column]
-        )
-
-        if not reg_no:
-            ignored_rows += 1
-            continue
-
-        if date_column >= len(row):
-            ignored_rows += 1
-            continue
-
-        raw_status = row[date_column]
-
-        status = convert_status(raw_status)
-
-        if status is None:
-            invalid_status_rows += 1
-            continue
-
-        students[reg_no] = status
-
-    return {
-        "section": section,
-        "sheet": sheet_name,
-        "date": normalize_date(requested_date),
-        "students": students,
-        "student_count": len(students),
-        "ignored_rows": ignored_rows,
-        "invalid_status_rows": invalid_status_rows,
-    }
+    return None
 
 
 # ============================================================
-# ROUTES
+# ATTENDANCE ENDPOINT
+# ============================================================
+
+@app.get("/attendance")
+def attendance(
+    section: str,
+    date: str
+):
+
+    try:
+
+        rows = read_sheet(section)
+
+        if not rows:
+            raise ValueError(
+                "No rows found."
+            )
+
+        headers = rows[0]
+
+        reg_column = find_reg_column(
+            headers
+        )
+
+        if reg_column is None:
+            raise ValueError(
+                "Registration-number column "
+                "was not found."
+            )
+
+        date_column = find_date_column(
+            headers,
+            date
+        )
+
+        if date_column is None:
+            raise ValueError(
+                f"Date '{date}' was not found "
+                f"in the header row."
+            )
+
+        students = {}
+
+        for row in rows[1:]:
+
+            if reg_column >= len(row):
+                continue
+
+            registration = normalize_reg(
+                row[reg_column]
+            )
+
+            if not registration:
+                continue
+
+            if date_column >= len(row):
+                continue
+
+            status = normalize_status(
+                row[date_column]
+            )
+
+            if status:
+                students[
+                    registration
+                ] = status
+
+        return {
+            "section": section,
+            "date": normalize_date(date),
+            "students": students,
+            "student_count": len(students)
+        }
+
+    except Exception as error:
+
+        print(
+            "ERROR:",
+            repr(error)
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail=str(error)
+        )
+
+
+# ============================================================
+# HEALTH
 # ============================================================
 
 @app.get("/")
@@ -371,8 +305,7 @@ def root():
 
     return {
         "status": "online",
-        "service": "ERP Attendance Automation API",
-        "version": "1.0.0",
+        "service": "ERP Attendance Automation"
     }
 
 
@@ -388,37 +321,7 @@ def health():
 def sections():
 
     return {
-        "sections": list(SECTION_SHEETS.keys())
+        "sections": list(
+            SECTION_GIDS.keys()
+        )
     }
-
-
-@app.get("/attendance")
-def attendance(
-    section: str = Query(...),
-    date: str = Query(...),
-):
-
-    try:
-
-        result = read_attendance(
-            section=section,
-            requested_date=date,
-        )
-
-        return result
-
-    except ValueError as exc:
-
-        raise HTTPException(
-            status_code=400,
-            detail=str(exc),
-        )
-
-    except Exception as exc:
-
-        print("ERROR:", repr(exc))
-
-        raise HTTPException(
-            status_code=500,
-            detail="Unable to read Google Sheet.",
-        )
