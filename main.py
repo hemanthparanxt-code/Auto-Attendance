@@ -2,12 +2,12 @@
 
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 
 import gspread
 from google.oauth2.service_account import Credentials
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 
 
@@ -17,35 +17,24 @@ from fastapi.middleware.cors import CORSMiddleware
 
 SPREADSHEET_ID = "1FIbRKZURuq11JXmkp0w-erTdroI2fWCoZhmxjpze-uE"
 
-# IMPORTANT:
-# The values on the RIGHT must exactly match your Google
-# Sheets tab names.
-#
-# Example:
-# "106-AIDE-1A": "106-AIDE-1A"
-#
-# If your actual tab names are different, change them here.
-
 SECTION_SHEETS = {
     "313-AIAGAI-1D": "313-AIAGAI-1D",
     "106-AIDE-1A": "106-AIDE-1A",
     "109-AIDE-1B": "109-AIDE-1B",
 }
 
-
-# Render Secret File
 GOOGLE_CREDENTIAL_FILE = (
     "/etc/secrets/google-service-account.json"
 )
 
 
 # ============================================================
-# FASTAPI APP
+# FASTAPI
 # ============================================================
 
 app = FastAPI(
     title="ERP Attendance Automation API",
-    version="1.0.0",
+    version="1.1.0",
 )
 
 
@@ -63,13 +52,10 @@ app.add_middleware(
 
 
 # ============================================================
-# BASIC HELPERS
+# HELPERS
 # ============================================================
 
 def clean(value):
-    """
-    Convert a value to a clean string.
-    """
     if value is None:
         return ""
 
@@ -77,31 +63,14 @@ def clean(value):
 
 
 def normalize_registration(value):
-    """
-    Normalize registration number.
-
-    Example:
-        '252U1R8045'
-        ' 252U1R8045 '
-        '252 U1R 8045'
-
-    all become:
-
-        '252U1R8045'
-    """
-
     return re.sub(
         r"\s+",
         "",
-        clean(value).upper(),
+        clean(value).upper()
     )
 
 
 def normalize_status(value):
-    """
-    Convert common attendance values into
-    Present / Absent.
-    """
 
     value = clean(value).lower()
 
@@ -132,17 +101,16 @@ def normalize_status(value):
     return None
 
 
-def normalize_date(value):
-    """
-    Convert supported date formats to:
+# ============================================================
+# DATE PARSING
+# ============================================================
 
-        DD-MM-YYYY
-    """
+def parse_date(value):
 
     value = clean(value)
 
     if not value:
-        return ""
+        return None
 
     formats = [
         "%d-%m-%Y",
@@ -151,18 +119,34 @@ def normalize_date(value):
         "%Y-%m-%d",
         "%m-%d-%Y",
         "%m/%d/%Y",
+        "%Y/%m/%d",
     ]
 
     for fmt in formats:
+
         try:
+
             return datetime.strptime(
                 value,
-                fmt,
-            ).strftime("%d-%m-%Y")
+                fmt
+            ).date()
+
         except ValueError:
             continue
 
-    return value
+    return None
+
+
+def normalize_date(value):
+
+    parsed = parse_date(value)
+
+    if parsed is None:
+        return clean(value)
+
+    return parsed.strftime(
+        "%d-%m-%Y"
+    )
 
 
 # ============================================================
@@ -170,14 +154,11 @@ def normalize_date(value):
 # ============================================================
 
 def get_google_client():
-    """
-    Authenticate using the Google service-account
-    JSON stored in Render Secret Files.
-    """
 
     if not os.path.exists(
         GOOGLE_CREDENTIAL_FILE
     ):
+
         raise RuntimeError(
             "Google service-account file not found at: "
             + GOOGLE_CREDENTIAL_FILE
@@ -197,11 +178,9 @@ def get_google_client():
             )
         )
 
-        client = gspread.authorize(
+        return gspread.authorize(
             credentials
         )
-
-        return client
 
     except Exception as error:
 
@@ -212,31 +191,7 @@ def get_google_client():
 
 
 # ============================================================
-# OPEN SPREADSHEET
-# ============================================================
-
-def get_spreadsheet():
-
-    try:
-
-        client = get_google_client()
-
-        spreadsheet = client.open_by_key(
-            SPREADSHEET_ID
-        )
-
-        return spreadsheet
-
-    except Exception as error:
-
-        raise RuntimeError(
-            "Could not open Google Spreadsheet: "
-            + str(error)
-        )
-
-
-# ============================================================
-# OPEN SECTION WORKSHEET
+# OPEN WORKSHEET
 # ============================================================
 
 def get_worksheet(section):
@@ -246,10 +201,6 @@ def get_worksheet(section):
         raise ValueError(
             "Unknown section: "
             + section
-            + ". Available sections: "
-            + ", ".join(
-                SECTION_SHEETS.keys()
-            )
         )
 
     worksheet_name = SECTION_SHEETS[
@@ -258,7 +209,15 @@ def get_worksheet(section):
 
     try:
 
-        spreadsheet = get_spreadsheet()
+        # IMPORTANT:
+        # A new Google client is created for every request.
+        # Nothing is stored globally.
+
+        client = get_google_client()
+
+        spreadsheet = client.open_by_key(
+            SPREADSHEET_ID
+        )
 
         worksheet = spreadsheet.worksheet(
             worksheet_name
@@ -301,24 +260,25 @@ def find_registration_column(headers):
         "admission number",
     }
 
-    # First: exact matches
+    # Exact match
+
     for index, header in enumerate(headers):
 
-        normalized = (
-            clean(header)
-            .lower()
-        )
+        normalized = clean(
+            header
+        ).lower()
 
         if normalized in possible_names:
+
             return index
 
-    # Second: partial matches
+    # Partial match
+
     for index, header in enumerate(headers):
 
-        normalized = (
-            clean(header)
-            .lower()
-        )
+        normalized = clean(
+            header
+        ).lower()
 
         if (
             "registration" in normalized
@@ -328,68 +288,41 @@ def find_registration_column(headers):
             or "rollno" in normalized
             or "admission no" in normalized
         ):
+
             return index
 
     return None
 
 
 # ============================================================
-# FIND DATE COLUMN
+# FIND ALL DATE COLUMNS
 # ============================================================
 
-def find_date_column(
+def find_date_columns(
     headers,
     requested_date,
 ):
-    """
-    Find the column containing the requested date.
-    """
 
-    requested = normalize_date(
+    requested = parse_date(
         requested_date
     )
 
-    # --------------------------------------------------------
-    # Direct normalized comparison
-    # --------------------------------------------------------
+    if requested is None:
+        return []
+
+    matches = []
 
     for index, header in enumerate(headers):
 
-        header_date = normalize_date(
+        header_date = parse_date(
             header
         )
 
         if header_date == requested:
 
-            return index
+            matches.append(index)
 
-    # --------------------------------------------------------
-    # Additional comparison
-    # --------------------------------------------------------
-
-    requested_digits = re.sub(
-        r"\D",
-        "",
-        requested,
-    )
-
-    if requested_digits:
-
-        for index, header in enumerate(headers):
-
-            header_digits = re.sub(
-                r"\D",
-                "",
-                clean(header),
-            )
-
-            if (
-                header_digits
-                == requested_digits
-            ):
-                return index
-
-    return None
+    return matches
 
 
 # ============================================================
@@ -398,7 +331,7 @@ def find_date_column(
 
 def read_attendance(
     section,
-    date,
+    requested_date,
 ):
 
     worksheet = get_worksheet(
@@ -407,7 +340,13 @@ def read_attendance(
 
     try:
 
-        rows = worksheet.get_all_values()
+        # ====================================================
+        # FRESH GOOGLE SHEETS READ
+        # ====================================================
+
+        rows = worksheet.get_values(
+            value_render_option="FORMATTED_VALUE"
+        )
 
     except Exception as error:
 
@@ -432,9 +371,9 @@ def read_attendance(
             "is empty."
         )
 
-    # --------------------------------------------------------
-    # Find registration column
-    # --------------------------------------------------------
+    # ========================================================
+    # REGISTRATION COLUMN
+    # ========================================================
 
     registration_column = (
         find_registration_column(
@@ -451,40 +390,50 @@ def read_attendance(
             + " | ".join(headers)
         )
 
-    # --------------------------------------------------------
-    # Find date column
-    # --------------------------------------------------------
+    # ========================================================
+    # DATE COLUMNS
+    # ========================================================
 
-    date_column = find_date_column(
+    date_columns = find_date_columns(
         headers,
-        date,
+        requested_date,
     )
 
-    if date_column is None:
+    if not date_columns:
 
         raise ValueError(
-            f"Date '{date}' was not found "
-            "in the first row.\n\n"
+            f"Date '{requested_date}' "
+            "was not found in the first row.\n\n"
             "Headers found:\n"
             + " | ".join(headers)
         )
 
-    # --------------------------------------------------------
-    # Build attendance dictionary
-    # --------------------------------------------------------
+    # ========================================================
+    # IMPORTANT
+    #
+    # If the same date appears multiple times,
+    # use the RIGHTMOST column.
+    #
+    # Example:
+    #
+    # 8/29/2026 | 8/29/2026
+    #     old          latest
+    #
+    # ========================================================
+
+    date_column = date_columns[-1]
+
+    # ========================================================
+    # BUILD ATTENDANCE
+    # ========================================================
 
     students = {}
 
-    for row_number, row in enumerate(
-        rows[1:],
-        start=2,
-    ):
+    for row in rows[1:]:
 
-        # Registration column doesn't exist
-        if (
-            registration_column
-            >= len(row)
-        ):
+        # Registration column missing
+
+        if registration_column >= len(row):
             continue
 
         registration = (
@@ -495,15 +444,12 @@ def read_attendance(
             )
         )
 
-        # Empty registration
         if not registration:
             continue
 
-        # Date column doesn't exist
-        if (
-            date_column
-            >= len(row)
-        ):
+        # Date column missing
+
+        if date_column >= len(row):
             continue
 
         raw_status = row[
@@ -514,7 +460,6 @@ def read_attendance(
             raw_status
         )
 
-        # Ignore blank/unknown statuses
         if status is None:
             continue
 
@@ -522,11 +467,15 @@ def read_attendance(
             registration
         ] = status
 
-    return students
+    return (
+        students,
+        date_column,
+        date_columns,
+    )
 
 
 # ============================================================
-# ROOT ENDPOINT
+# ROOT
 # ============================================================
 
 @app.get("/")
@@ -535,24 +484,24 @@ def root():
     return {
         "status": "online",
         "service": "ERP Attendance Automation API",
-        "version": "1.0.0",
+        "version": "1.1.0",
     }
 
 
 # ============================================================
-# HEALTH ENDPOINT
+# HEALTH
 # ============================================================
 
 @app.get("/health")
 def health():
 
     return {
-        "status": "healthy",
+        "status": "healthy"
     }
 
 
 # ============================================================
-# SECTION ENDPOINT
+# SECTIONS
 # ============================================================
 
 @app.get("/sections")
@@ -561,12 +510,12 @@ def sections():
     return {
         "sections": list(
             SECTION_SHEETS.keys()
-        ),
+        )
     }
 
 
 # ============================================================
-# GOOGLE SHEET DIAGNOSTIC
+# DIAGNOSTIC
 # ============================================================
 
 @app.get("/diagnostic")
@@ -606,6 +555,7 @@ def diagnostic():
                 "title": sheet.title,
                 "id": sheet.id,
             }
+
             for sheet in worksheets
         ]
 
@@ -621,20 +571,21 @@ def diagnostic():
 
 
 # ============================================================
-# ATTENDANCE ENDPOINT
+# ATTENDANCE
 # ============================================================
 
 @app.get("/attendance")
 def attendance(
     section: str,
     date: str,
+    response: Response,
 ):
 
     try:
 
-        # ----------------------------------------------------
-        # Validate section
-        # ----------------------------------------------------
+        # ====================================================
+        # VALIDATE SECTION
+        # ====================================================
 
         if section not in SECTION_SHEETS:
 
@@ -644,41 +595,92 @@ def attendance(
                 f"{', '.join(SECTION_SHEETS.keys())}"
             )
 
-        # ----------------------------------------------------
-        # Normalize date
-        # ----------------------------------------------------
+        # ====================================================
+        # VALIDATE DATE
+        # ====================================================
 
         normalized_date = normalize_date(
             date
         )
 
-        if not normalized_date:
+        if not parse_date(
+            normalized_date
+        ):
 
             raise ValueError(
-                "Date cannot be empty."
+                "Invalid date.\n"
+                "Use DD-MM-YYYY."
             )
 
-        # ----------------------------------------------------
-        # Read attendance
-        # ----------------------------------------------------
+        # ====================================================
+        # DISABLE HTTP CACHING
+        # ====================================================
 
-        students = read_attendance(
+        response.headers[
+            "Cache-Control"
+        ] = (
+            "no-store, "
+            "no-cache, "
+            "must-revalidate, "
+            "max-age=0"
+        )
+
+        response.headers[
+            "Pragma"
+        ] = "no-cache"
+
+        response.headers[
+            "Expires"
+        ] = "0"
+
+        # ====================================================
+        # READ GOOGLE SHEET
+        # ====================================================
+
+        (
+            students,
+            selected_column,
+            matching_columns,
+        ) = read_attendance(
             section,
             normalized_date,
         )
 
-        # ----------------------------------------------------
-        # Return response
-        # ----------------------------------------------------
+        # ====================================================
+        # FETCH TIME
+        # ====================================================
+
+        fetched_at = (
+            datetime.now(
+                timezone.utc
+            ).isoformat()
+        )
+
+        # ====================================================
+        # RESPONSE
+        # ====================================================
 
         return {
+
             "status": "success",
+
             "section": section,
+
             "date": normalized_date,
-            "students": students,
-            "student_count": len(
-                students
-            ),
+
+            "fetched_at": fetched_at,
+
+            "selected_column_index":
+                selected_column,
+
+            "matching_date_columns":
+                matching_columns,
+
+            "student_count":
+                len(students),
+
+            "students":
+                students,
         }
 
     except Exception as error:
@@ -690,5 +692,5 @@ def attendance(
 
         raise HTTPException(
             status_code=500,
-            detail=str(error),
+            detail=str(error)
         )
